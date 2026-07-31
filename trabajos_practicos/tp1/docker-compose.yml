@@ -1,0 +1,11 @@
+services:
+  monitor:
+    build: .
+    tty: true
+    stdin_open: true
+    pid: "host"
+    volumes:
+      - /proc:/host_proc:ro
+    environment:
+      - PROC_BASE=/host_proc
+      - TERM=xterm-256color

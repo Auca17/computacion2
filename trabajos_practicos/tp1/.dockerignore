@@ -1,0 +1,32 @@
+# === Git ===
+.git/
+.gitignore
+
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+.venv/
+
+# === Material de estudio / interno ===
+estudio.md
+workflow.md
+consigna.md
+prompt_tutor_ia.md
+
+# === IDEs ===
+.vscode/
+.idea/
+*.code-workspace
+
+# === OS ===
+.DS_Store
+Thumbs.db
+
+# === Documentación no necesaria en la imagen ===
+README.md
+*.md
+!requirements.txt
+
