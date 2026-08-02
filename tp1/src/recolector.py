@@ -1,22 +1,17 @@
 """
-recolector.py - Consigue la lista de procesos activos.
+recolector.py - Obtiene la lista de procesos activos.
 
-Los otros módulos lo llaman para saber qué PIDs hay que analizar.
-Es solo una función re simple.
+Tener esto en un módulo separado hace que sea fácil de probar (podemos
+pasarle un PROC_BASE diferente) y de extender si en algún momento
+queremos filtrar procesos antes de mandarlos a los analizadores.
 """
 
 import os
-import sys
 
-# agrego la carpeta actual al path para poder importar procfs
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from procfs import list_pids, PROC_BASE
 
 
 def get_pids(proc_base=None):
-    # Trae los PIDs que están corriendo ahora.
-    # Llama directo a la función de procfs.
-    
-    # TODO: capaz esto es medio redundante si ya lo hace list_pids?
+    """Devuelve la lista de PIDs corriendo en este momento."""
     base = proc_base or os.environ.get("PROC_BASE", PROC_BASE)
     return list_pids(base)

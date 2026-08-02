@@ -14,17 +14,6 @@ import signal
 PROC_BASE = os.environ.get("PROC_BASE", "/proc")
 
 # ---
-# Diccionario para convertir números de señal a sus nombres (como SIGKILL)
-_SIGNAL_NAMES = {
-    1: "SIGHUP", 2: "SIGINT", 3: "SIGQUIT", 4: "SIGILL",
-    5: "SIGTRAP", 6: "SIGABRT", 7: "SIGBUS", 8: "SIGFPE",
-    9: "SIGKILL", 10: "SIGUSR1", 11: "SIGSEGV", 12: "SIGUSR2",
-    13: "SIGPIPE", 14: "SIGALRM", 15: "SIGTERM", 16: "SIGSTKFLT",
-    17: "SIGCHLD", 18: "SIGCONT", 19: "SIGSTOP", 20: "SIGTSTP",
-    21: "SIGTTIN", 22: "SIGTTOU", 23: "SIGURG", 24: "SIGXCPU",
-    25: "SIGXFSZ", 26: "SIGVTALRM", 27: "SIGPROF", 28: "SIGWINCH",
-    29: "SIGIO", 30: "SIGPWR", 31: "SIGSYS",
-}
 
 # TODO: buscar si hay más campos en /proc/<pid>/stat que nos sirvan después.
 # Estos son los campos de stat que necesitamos (el índice cuenta desde 0)
@@ -86,7 +75,11 @@ def _safe_int(value, default=0):
         return default
 
 
+# Alias público para que otros módulos puedan importarlo
+safe_int = _safe_int
+
 # ---
+
 
 def list_pids(proc_base=None):
     # Busca todas las carpetas en /proc que sean números (los PIDs).
@@ -296,17 +289,22 @@ def parse_thread_status(pid, tid, proc_base=None):
 
 def decode_signal_mask(hex_mask):
     # Pasa la máscara de señales (en hexa) a una lista con los nombres.
+    # Usa signal.Signals del módulo signal de Python, que conoce todos los
+    # números de señal del SO sin necesitar un diccionario hardcodeado.
     try:
         mask = int(hex_mask, 16)
     except (ValueError, TypeError):
         return []
 
     signals = []
-    # reviso bit por bit hasta 64
     for bit in range(64):
         if mask & (1 << bit):
             sig_num = bit + 1  # los números de señal arrancan en 1
-            name = _SIGNAL_NAMES.get(sig_num, f"SIG{sig_num}")
+            try:
+                name = signal.Signals(sig_num).name  # ej: 'SIGINT', 'SIGTERM'
+            except ValueError:
+                # número de señal sin nombre estándar en esta plataforma
+                name = f"SIG{sig_num}"
             signals.append(name)
     return signals
 

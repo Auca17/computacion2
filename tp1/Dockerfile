@@ -10,5 +10,6 @@ COPY src/ src/
 
 ENV TERM=xterm-256color
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app/src
 
 CMD ["python", "-u", "src/main.py"]

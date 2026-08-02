@@ -9,16 +9,14 @@ Intervalo: 5 s
 """
 
 import os
-import sys
 import time
 import multiprocessing
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from procfs import (
     list_pids,
     list_fds,
     PROC_BASE,
 )
+from senales import ignorar_senales_en_hijo
 
 
 class FDsAnalyzer(multiprocessing.Process):
@@ -36,6 +34,7 @@ class FDsAnalyzer(multiprocessing.Process):
 
     def run(self):
         """Corre hasta que salte el evento de stop."""
+        ignorar_senales_en_hijo()  # solo el proceso principal maneja las señales
         while not self.stop_event.is_set():
             try:
                 data = self._collect()

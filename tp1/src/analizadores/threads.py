@@ -9,11 +9,9 @@ Intervalo: 2 s
 """
 
 import os
-import sys
 import time
 import multiprocessing
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from procfs import (
     list_pids,
     list_threads,
@@ -22,18 +20,10 @@ from procfs import (
     parse_thread_status,
     parse_proc_stat,
     calc_cpu_percent,
+    safe_int,
     PROC_BASE,
 )
-
-
-def _safe_int(value, default=0):
-    """
-    Trata de convertir a entero, si falla devuelve un valor por defecto.
-    """
-    try:
-        return int(value)
-    except (ValueError, TypeError):
-        return default
+from senales import ignorar_senales_en_hijo
 
 
 class ThreadsAnalyzer(multiprocessing.Process):
@@ -58,6 +48,7 @@ class ThreadsAnalyzer(multiprocessing.Process):
 
     def run(self):
         """Loop que corre y duerme."""
+        ignorar_senales_en_hijo()  # solo el proceso principal maneja las señales
         while not self.stop_event.is_set():
             try:
                 data = self._collect()
@@ -114,10 +105,10 @@ class ThreadsAnalyzer(multiprocessing.Process):
                         )
 
                         # context switches
-                        vol_ctxt = _safe_int(
+                        vol_ctxt = safe_int(
                             tstatus.get("voluntary_ctxt_switches", "0")
                         )
-                        nonvol_ctxt = _safe_int(
+                        nonvol_ctxt = safe_int(
                             tstatus.get("nonvoluntary_ctxt_switches", "0")
                         )
 

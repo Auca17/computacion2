@@ -5,14 +5,9 @@ y arranca todos los procesos analizadores junto con la interfaz.
 """
 
 import os
-import sys
 import json
 import multiprocessing
 import curses
-
-# Agrego src/ al path para que funcionen los imports relativos
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 
 def load_config(path="config.json"):
     """

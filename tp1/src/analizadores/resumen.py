@@ -10,11 +10,8 @@ Intervalo por defecto: 2 s
 """
 
 import os
-import sys
 import time
 import multiprocessing
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from procfs import (
     list_pids,
     parse_stat,
@@ -25,6 +22,7 @@ from procfs import (
     calc_cpu_percent,
     PROC_BASE,
 )
+from senales import ignorar_senales_en_hijo
 
 
 class ResumenAnalyzer(multiprocessing.Process):
@@ -51,6 +49,7 @@ class ResumenAnalyzer(multiprocessing.Process):
 
     def run(self):
         """Loop principal: recolecta, guarda y duerme hasta que nos paren."""
+        ignorar_senales_en_hijo()  # solo el proceso principal maneja las señales
         while not self.stop_event.is_set():
             try:
                 data = self._collect()

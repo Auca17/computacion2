@@ -10,6 +10,28 @@ import signal
 import time
 
 
+# Señales que los procesos hijos deben ignorar.
+# SIGTERM NO está en la lista a propósito: es como Process.terminate() del padre
+# le pide al hijo que se cierre. Si lo ignoramos, los hijos quedan vivos para siempre
+# después del shutdown (bug real si no lo tenés en cuenta).
+_SENALES_A_IGNORAR_EN_HIJO = (
+    signal.SIGINT,
+    signal.SIGHUP,
+    signal.SIGUSR1,
+    signal.SIGUSR2,
+)
+
+
+def ignorar_senales_en_hijo():
+    """
+    Los analizadores y el recolector llaman esto al inicio de su run().
+    La decisión de qué hacer con cada señal del monitor la toma SOLO el
+    proceso principal — los hijos se desentieden de todo eso.
+    """
+    for sig in _SENALES_A_IGNORAR_EN_HIJO:
+        signal.signal(sig, signal.SIG_IGN)
+
+
 class SignalHandler:
     """
     Manejador de señales usando el patrón "self-pipe".

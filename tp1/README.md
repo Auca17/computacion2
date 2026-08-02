@@ -134,14 +134,15 @@ El tradeoff es performance: cada lectura/escritura pasa por un socket Unix al pr
 | Scheduling | 10s | Nice/priority/policy son casi estáticos |
 | Sistema | 2s | El CPU global y load cambian frecuentemente |
 
-### ¿Por qué el patrón self-pipe para señales?
+### ¿Por qué el patrón self-pipe y el aislamiento de señales en hijos?
 
 Los signal handlers de Python son limitados: solo pueden setear flags o escribir a un pipe. No pueden llamar funciones complejas como serializar JSON o leer archivos. El patrón self-pipe (`signal.set_wakeup_fd`) permite:
 
 1. El handler solo hace `self._received_signals.append(signum)` — mínimo y seguro.
 2. El byte de wakeup se escribe automáticamente al pipe.
 3. El loop principal drena el pipe y procesa las señales fuera del contexto del handler. Esto es exactamente lo que dice la documentación de `signal.set_wakeup_fd()` y lo que vimos en clase 6.
-4. **Integración con el Display y refresco en caliente**: El `SignalHandler` está enlazado directamente al objeto `Display` que corre en el hilo principal. El loop de curses procesa señales pendientes en cada iteración. Al recibir `SIGHUP`, se recargan de inmediato los intervalos y los filtros de comando/usuario configurados en `config.json`. Al recibir `SIGUSR2`, se conmuta el modo verbose, lo que de inmediato expande la lista de FDs visibles (mostrando la lista completa en lugar de los 5 por defecto) y muestra `(VERBOSE)` en la barra superior.
+4. **Aislamiento de señales en procesos hijos (`ignorar_senales_en_hijo()`)**: Al arrancar cada analizador y el recolector, se llama a `ignorar_senales_en_hijo()`. Esto configura `signal.SIG_IGN` para `SIGINT`, `SIGHUP`, `SIGUSR1` y `SIGUSR2` en todos los procesos secundarios. De este modo, cuando el usuario envía un `Ctrl+C` en la terminal o manda una señal al grupo de procesos, **solo el proceso principal (display/orquestador)** la procesa y coordina las acciones. **Importante**: `SIGTERM` NO se ignora en los hijos, permitiendo que `Process.terminate()` del padre pueda finalizar cualquier hijo inmediatamente en caso de shutdown de emergencia.
+5. **Integración con el Display y refresco en caliente**: El `SignalHandler` está enlazado directamente al objeto `Display` que corre en el hilo principal. El loop de curses procesa señales pendientes en cada iteración. Al recibir `SIGHUP`, se recargan de inmediato los intervalos y los filtros de comando/usuario configurados en `config.json`. Al recibir `SIGUSR2`, se conmuta el modo verbose, lo que de inmediato expande la lista de FDs visibles (mostrando la lista completa en lugar de los 5 por defecto) y muestra `(VERBOSE)` en la barra superior.
 
 ---
 
@@ -161,11 +162,13 @@ La vista FDs lista todos los file descriptors abiertos de un proceso leyendo los
 
 ### Clase 6 — Señales
 
-Dos aspectos:
+Tres aspectos clave:
 
-1. **Lectura de señales de los procesos monitoreados**: La vista Señales decodifica las máscaras hexadecimales de 64 bits de `/proc/<pid>/status` (SigBlk, SigIgn, SigCgt, SigPnd, ShdPnd). Cada bit representa una señal — bit 0 = señal 1 (SIGHUP), bit 1 = señal 2 (SIGINT), etc. `decode_signal_mask()` convierte esto a nombres legibles.
+1. **Lectura de señales de los procesos monitoreados**: La vista Señales decodifica las máscaras hexadecimales de 64 bits de `/proc/<pid>/status` (SigBlk, SigIgn, SigCgt, SigPnd, ShdPnd). Cada bit representa una señal — bit 0 = señal 1 (SIGHUP), bit 1 = señal 2 (SIGINT), etc. La función `decode_signal_mask()` utiliza dinámicamente `signal.Signals(sig_num).name` de la stdlib de Python para obtener la representación simbólica exacta POSIX de cada señal sin depender de diccionarios harcodeados.
 
-2. **Manejo de señales del monitor**: Usamos `signal.set_wakeup_fd()` (patrón self-pipe de clase 6) para que SIGINT/SIGTERM hagan shutdown limpio, SIGHUP recargue configuración, SIGUSR1 haga dump, y SIGUSR2 toggle verbose.
+2. **Manejo de señales del monitor (Self-Pipe)**: Usamos `signal.set_wakeup_fd()` (patrón self-pipe de clase 6) para que SIGINT/SIGTERM hagan shutdown limpio, SIGHUP recargue configuración en caliente, SIGUSR1 genere un snapshot en JSON y SIGUSR2 alterne el modo verbose.
+
+3. **Aislamiento en subprocesos**: Invocamos `ignorar_senales_en_hijo()` al inicializar cada worker para que las señales de teclado (`SIGINT`) enviadas al grupo de procesos sean procesadas exclusivamente por el orquestador principal.
 
 ### Clase 7 — mmap y memoria compartida
 
