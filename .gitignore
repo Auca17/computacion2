@@ -49,10 +49,6 @@ venv/
 # === Claude ===
 .claude/
 
-
-
-
-
 # Python
 venv/
 __pycache__/

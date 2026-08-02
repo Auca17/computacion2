@@ -1,1 +1,3 @@
-# computacion2
+# Computación II — 2026
+
+Alumno: Augustus Rufino
