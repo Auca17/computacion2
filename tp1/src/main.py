@@ -8,6 +8,7 @@ import os
 import json
 import multiprocessing
 import curses
+import signal
 
 def load_config(path="config.json"):
     """
@@ -126,4 +127,17 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        # Si curses falla por falta de TTY, mostramos un mensaje claro
+        import sys
+        if "ERR" in str(e) or "curses" in str(type(e).__module__):
+            print(
+                "\n[ERROR] curses necesita un terminal real (TTY).\n"
+                "Usá: docker compose run --rm monitor\n"
+                "  o: docker compose up  (con el terminal attached)\n",
+                file=sys.stderr,
+            )
+        else:
+            raise

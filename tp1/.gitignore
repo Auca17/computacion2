@@ -1,0 +1,24 @@
+# === Material de estudio / interno (no subir) ===
+estudio.md
+workflow.md
+
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+venv/
+.venv/
+
+# === Docker ===
+dump_*.json
+
+# === IDEs ===
+.vscode/
+.idea/
+*.code-workspace
+
+# === OS ===
+.DS_Store
+Thumbs.db
