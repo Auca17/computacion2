@@ -50,7 +50,11 @@ async def _descargar_url(cliente: httpx.AsyncClient, url: str) -> dict:
 
 
 async def descargar(parametros: dict, executor: Optional[ProcessPoolExecutor]):
-    """Descarga todas las URLs concurrentemente."""
+    """Descarga todas las URLs concurrentemente.
+
+    Si la tarea se cancela, `gather` cancela sus hijas y `async with` cierra
+    las conexiones: no quedan corrutinas huérfanas.
+    """
     async with httpx.AsyncClient(follow_redirects=True, timeout=30) as cliente:
         return await asyncio.gather(
             *(_descargar_url(cliente, url) for url in parametros["urls"])
@@ -61,7 +65,9 @@ async def hashear(parametros: dict, executor: Optional[ProcessPoolExecutor]):
     """SHA-256 iterado, en bloques dentro de un ProcessPoolExecutor.
 
     Entre bloque y bloque se hace `await`: el event loop sigue libre y la
-    cancelación puede entrar entre bloques.
+    cancelación puede entrar entre bloques. Al cancelar, el bloque que ya está
+    en el proceso termina por su cuenta (a lo sumo un bloque de trabajo
+    desperdiciado) y su resultado se descarta; no se encolan más.
     """
     digest = hashlib.sha256(parametros["texto"].encode()).digest()
     restantes = parametros["iteraciones"] - 1

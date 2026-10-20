@@ -80,10 +80,14 @@ async def obtener_tarea(id_tarea: str):
 
 @router.delete("/tareas/{id_tarea}")
 async def cancelar_tarea(id_tarea: str):
-    """Cancelación pendiente de implementar (fase F3)."""
-    if id_tarea not in registro:
+    """Cancela una tarea pendiente o en ejecución."""
+    tarea = registro.get(id_tarea)
+    if tarea is None:
         raise HTTPException(404, "Tarea inexistente")
-    raise HTTPException(501, "Cancelación no implementada todavía")
+    if tarea.estado not in ("pendiente", "ejecutando"):
+        raise HTTPException(409, f"La tarea ya está {tarea.estado}")
+    await plataforma.cancelar(tarea)
+    return tarea.a_dict()
 
 
 @router.get("/estadisticas")
