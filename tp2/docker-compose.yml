@@ -1,0 +1,51 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      WORKERS: ${WORKERS:-4}
+      TIMEOUT_DEFECTO: ${TIMEOUT_DEFECTO:-30}
+      GRACIA_APAGADO: ${GRACIA_APAGADO:-10}
+      MODO_CPU: ${MODO_CPU:-executor}
+      MAX_COLA: ${MAX_COLA:-1000}
+      MAX_CONEXIONES: ${MAX_CONEXIONES:-20}
+      ENVEJECIMIENTO_S: ${ENVEJECIMIENTO_S:-5}
+      BACKOFF_BASE: ${BACKOFF_BASE:-1}
+      RATE_LIMIT_POR_SEG: ${RATE_LIMIT_POR_SEG:-20}
+      RATE_LIMIT_RAFAGA: ${RATE_LIMIT_RAFAGA:-40}
+      # PROCESOS_CPU: sin definir usa os.cpu_count()
+      DIR_VOLCADOS: /datos
+    volumes:
+      - ./datos:/datos
+    # Mayor que GRACIA_APAGADO (10 s) + margen de uvicorn, para que
+    # Docker no mate el proceso antes del volcado de estado
+    stop_grace_period: 30s
+    depends_on:
+      - lento
+
+  lento:
+    build: .
+    command: ["python", "-m", "servidor_lento.main"]
+    ports:
+      - "8001:8001"
+
+  # Bonus Celery: solo se levanta con `--profile celery`
+  redis:
+    image: redis:7-alpine
+    profiles: ["celery"]
+    ports:
+      - "6379:6379"
+
+  celery_worker:
+    build: .
+    profiles: ["celery"]
+    command: >
+      celery -A celery_app.tareas worker --loglevel=info
+      --concurrency=${CELERY_CONCURRENCIA:-4}
+    environment:
+      CELERY_BROKER: redis://redis:6379/0
+      CELERY_CONCURRENCIA: ${CELERY_CONCURRENCIA:-4}
+    depends_on:
+      - redis
+      - lento
