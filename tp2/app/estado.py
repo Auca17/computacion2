@@ -29,6 +29,12 @@ class Tarea:
     creada: float = field(default_factory=time.time)
     iniciada: Optional[float] = None
     finalizada: Optional[float] = None
+    prioridad: int = 5  # 1 = más alta ... 10 = más baja
+    reintentos: int = 0  # reintentos permitidos tras un fallo
+    intentos: int = 0  # ejecuciones realizadas
+    errores: list = field(default_factory=list)  # motivo de cada fallo
+    proximo_intento: Optional[float] = None  # epoch del reencolado (backoff)
+    encolada: float = field(default_factory=time.time)  # última entrada a la cola
 
     def duracion(self) -> Optional[float]:
         """Segundos entre inicio y fin, o None si no terminó."""
@@ -49,6 +55,11 @@ class Tarea:
             "iniciada": self.iniciada,
             "finalizada": self.finalizada,
             "timeout": self.timeout,
+            "prioridad": self.prioridad,
+            "reintentos": self.reintentos,
+            "intentos": self.intentos,
+            "errores": self.errores,
+            "proximo_intento": self.proximo_intento,
         }
 
 

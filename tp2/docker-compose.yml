@@ -9,6 +9,12 @@ services:
       GRACIA_APAGADO: ${GRACIA_APAGADO:-10}
       MODO_CPU: ${MODO_CPU:-executor}
       MAX_COLA: ${MAX_COLA:-1000}
+      MAX_CONEXIONES: ${MAX_CONEXIONES:-20}
+      ENVEJECIMIENTO_S: ${ENVEJECIMIENTO_S:-5}
+      BACKOFF_BASE: ${BACKOFF_BASE:-1}
+      RATE_LIMIT_POR_SEG: ${RATE_LIMIT_POR_SEG:-20}
+      RATE_LIMIT_RAFAGA: ${RATE_LIMIT_RAFAGA:-40}
+      # PROCESOS_CPU: sin definir usa os.cpu_count()
       DIR_VOLCADOS: /datos
     volumes:
       - ./datos:/datos

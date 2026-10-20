@@ -8,6 +8,7 @@ import pytest
 from app import config
 from app.estado import registro
 from app.cola import plataforma
+from app.limite import limitador
 from app.main import app
 
 
@@ -20,9 +21,11 @@ def configuracion(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "MODO_CPU", "executor")
     monkeypatch.setattr(config, "DIR_VOLCADOS", str(tmp_path / "volcados"))
     registro.clear()
+    limitador.reiniciar()
     plataforma.aceptando = True
     plataforma.ocupados = 0
     plataforma.en_ejecucion.clear()
+    plataforma.temporizadores.clear()
     yield
     registro.clear()
 

@@ -28,6 +28,8 @@ def calcular_estadisticas() -> dict:
         "workers_ocupados": plataforma.ocupados,
         "workers_total": config.WORKERS,
         "tamanio_cola": plataforma.cola.qsize() if plataforma.cola else 0,
+        "reintentos_programados": plataforma.reintentos_programados,
+        "rechazadas_por_limite": plataforma.rechazadas_por_limite,
     }
 
 
@@ -53,6 +55,12 @@ async def metricas() -> Response:
              [("", est["workers_total"])])
     _metrica(lineas, "cola_tamano", "gauge", "Tareas esperando en la cola",
              [("", est["tamanio_cola"])])
+    _metrica(lineas, "reintentos_programados_total", "counter",
+             "Reintentos programados tras un fallo",
+             [("", est["reintentos_programados"])])
+    _metrica(lineas, "rechazadas_por_limite_total", "counter",
+             "Tareas rechazadas por el límite de tasa por cliente",
+             [("", est["rechazadas_por_limite"])])
     _metrica(lineas, "tarea_duracion_segundos_promedio", "gauge",
              "Duración promedio por tipo de tarea",
              [(f'{{tipo="{t}"}}', round(d, 6))

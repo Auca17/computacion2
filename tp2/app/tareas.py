@@ -1,6 +1,7 @@
 """Implementación de los tres tipos de tarea."""
 
 import asyncio
+import contextlib
 import hashlib
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -49,16 +50,61 @@ async def _descargar_url(cliente: httpx.AsyncClient, url: str) -> dict:
         }
 
 
-async def descargar(parametros: dict, executor: Optional[ProcessPoolExecutor]):
-    """Descarga todas las URLs concurrentemente.
+async def _en_paralelo(funcion, elementos: list) -> list:
+    """Corre `funcion(elemento)` para cada elemento, concurrentemente.
 
-    Si la tarea se cancela, `gather` cancela sus hijas y `async with` cierra
-    las conexiones: no quedan corrutinas huérfanas.
+    TaskGroup da concurrencia estructurada: todas las hijas terminan antes de
+    salir del bloque y, si se cancela la tarea, se cancelan juntas. El
+    Semaphore limita las conexiones simultáneas a MAX_CONEXIONES. El
+    resultado conserva el orden de `elementos`.
+    """
+    limite = asyncio.Semaphore(config.MAX_CONEXIONES)
+
+    async def limitada(elemento):
+        async with limite:
+            return await funcion(elemento)
+
+    async with asyncio.TaskGroup() as grupo:
+        hijas = [grupo.create_task(limitada(e)) for e in elementos]
+    return [hija.result() for hija in hijas]
+
+
+async def descargar(parametros: dict, executor: Optional[ProcessPoolExecutor]):
+    """Descarga todas las URLs concurrentemente (máx. MAX_CONEXIONES a la vez).
+
+    `_descargar_url` captura sus propios errores, así que ninguna hija hace
+    fallar al TaskGroup. Al cancelar, `async with` cierra las conexiones.
     """
     async with httpx.AsyncClient(follow_redirects=True, timeout=30) as cliente:
-        return await asyncio.gather(
-            *(_descargar_url(cliente, url) for url in parametros["urls"])
-        )
+        return await _en_paralelo(
+            lambda url: _descargar_url(cliente, url), parametros["urls"])
+
+
+async def _sondear_puerto(host: str, puerto: int, timeout: float) -> dict:
+    """Intenta conectar a un puerto TCP; informa abierto/cerrado y latencia."""
+    inicio = time.perf_counter()
+    try:
+        _, escritor = await asyncio.wait_for(
+            asyncio.open_connection(host, puerto), timeout)
+    except TimeoutError:  # antes que OSError, de la que es subclase
+        return {"puerto": puerto, "abierto": False,
+                "motivo": f"timeout: sin respuesta en {timeout} s"}
+    except OSError as exc:
+        return {"puerto": puerto, "abierto": False,
+                "motivo": f"{type(exc).__name__}: {exc}"}
+    ms = round((time.perf_counter() - inicio) * 1000, 2)
+    escritor.close()
+    with contextlib.suppress(OSError):
+        await escritor.wait_closed()
+    return {"puerto": puerto, "abierto": True, "ms": ms}
+
+
+async def sondear(parametros: dict, executor: Optional[ProcessPoolExecutor]):
+    """Chequea concurrentemente qué puertos TCP de un host están abiertos."""
+    return await _en_paralelo(
+        lambda puerto: _sondear_puerto(
+            parametros["host"], puerto, parametros["timeout_conexion"]),
+        parametros["puertos"])
 
 
 async def hashear(parametros: dict, executor: Optional[ProcessPoolExecutor]):
@@ -86,4 +132,5 @@ async def hashear(parametros: dict, executor: Optional[ProcessPoolExecutor]):
     return digest.hex()
 
 
-EJECUTORES = {"descargar": descargar, "hashear": hashear, "esperar": esperar}
+EJECUTORES = {"descargar": descargar, "hashear": hashear, "esperar": esperar,
+              "sondear": sondear}

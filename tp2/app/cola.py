@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import random
 import time
 from concurrent.futures import ProcessPoolExecutor
 from typing import Optional
@@ -14,22 +15,62 @@ from .tareas import EJECUTORES
 log = logging.getLogger("plataforma")
 
 
+class ColaConPrioridad(asyncio.Queue):
+    """Cola acotada que entrega primero la tarea de menor prioridad efectiva.
+
+    Hereda de `asyncio.Queue` y solo redefine los hooks `_init/_put/_get`,
+    igual que `asyncio.PriorityQueue`: `maxsize`, `put_nowait` (QueueFull),
+    `get`, `task_done` y `join` funcionan sin cambios.
+
+    Anti-inanición (envejecimiento): la prioridad efectiva es
+    `prioridad - espera / ENVEJECIMIENTO_S`. Cuanto más espera una tarea,
+    más baja su valor, así que una de baja prioridad que lleva suficiente
+    tiempo en la cola termina ganándole a las tareas nuevas de alta
+    prioridad y nunca queda postergada para siempre. A igual valor gana la
+    que entró antes (FIFO).
+    """
+
+    def _init(self, maxsize: int) -> None:
+        self._queue = []
+
+    def _put(self, tarea: Tarea) -> None:
+        tarea.encolada = time.time()  # la espera se mide desde acá
+        self._queue.append(tarea)
+
+    def _get(self) -> Tarea:
+        # Búsqueda lineal: n <= MAX_COLA y se calcula con el instante actual.
+        ahora = time.time()
+        indice = min(
+            range(len(self._queue)),
+            key=lambda i: (
+                self._queue[i].prioridad
+                - (ahora - self._queue[i].encolada) / config.ENVEJECIMIENTO_S,
+                self._queue[i].encolada,
+            ),
+        )
+        return self._queue.pop(indice)
+
+
 class Plataforma:
     """Cola acotada, workers y executor para tareas CPU-bound."""
 
     def __init__(self) -> None:
-        self.cola: Optional[asyncio.Queue] = None
+        self.cola: Optional[ColaConPrioridad] = None
         self.workers: list[asyncio.Task] = []
         self.executor: Optional[ProcessPoolExecutor] = None
         self.ocupados = 0
         self.aceptando = True
         # Ejecución de cada tarea en curso como asyncio.Task propio: id -> Task
         self.en_ejecucion: dict[str, asyncio.Task] = {}
+        # Temporizadores de backoff de tareas por reintentar: id -> Task
+        self.temporizadores: dict[str, asyncio.Task] = {}
+        self.reintentos_programados = 0
+        self.rechazadas_por_limite = 0
 
     def iniciar(self) -> None:
         """Crea la cola, el executor y las corrutinas worker."""
-        self.cola = asyncio.Queue(maxsize=config.MAX_COLA)
-        self.executor = ProcessPoolExecutor()
+        self.cola = ColaConPrioridad(maxsize=config.MAX_COLA)
+        self.executor = ProcessPoolExecutor(max_workers=config.PROCESOS_CPU)
         self.workers = [
             asyncio.create_task(self._worker()) for _ in range(config.WORKERS)
         ]
@@ -87,6 +128,7 @@ class Plataforma:
 
     async def _ejecutar(self, tarea: Tarea) -> None:
         """Ejecuta una tarea y registra su resultado o su motivo de fallo."""
+        tarea.intentos += 1
         try:
             async with asyncio.timeout(tarea.timeout):
                 tarea.resultado = await EJECUTORES[tarea.tipo](
@@ -94,23 +136,59 @@ class Plataforma:
                 )
             tarea.estado = "completada"
         except TimeoutError:
-            tarea.estado = "fallida"
-            tarea.error = f"timeout: superó {tarea.timeout} segundos"
+            self._fallar(tarea, f"timeout: superó {tarea.timeout} segundos")
         except asyncio.CancelledError:
             tarea.estado = "cancelada"
             raise  # la cancelación nunca se traga
         except Exception as exc:
             log.exception("La tarea %s falló", tarea.id)
-            tarea.estado = "fallida"
-            tarea.error = f"{type(exc).__name__}: {exc}"
+            self._fallar(tarea, f"{type(exc).__name__}: {exc}")
         finally:
+            if tarea.estado != "pendiente":  # pendiente = espera un reintento
+                tarea.finalizada = time.time()
+            publicar(tarea)
+
+    def _fallar(self, tarea: Tarea, motivo: str) -> None:
+        """Registra el fallo; si quedan reintentos, programa el reencolado.
+
+        La espera del backoff la hace un temporizador aparte: el worker queda
+        libre de inmediato. El cambio de estado lo publica quien llama.
+        """
+        tarea.errores.append(motivo)
+        if tarea.intentos > tarea.reintentos:
+            tarea.estado = "fallida"
+            tarea.error = motivo
+            return
+        demora = (config.BACKOFF_BASE * 2 ** (tarea.intentos - 1)
+                  * random.uniform(0.8, 1.2))
+        tarea.estado = "pendiente"
+        tarea.proximo_intento = time.time() + demora
+        self.reintentos_programados += 1
+        self.temporizadores[tarea.id] = asyncio.create_task(
+            self._reencolar_tras(tarea, demora))
+
+    async def _reencolar_tras(self, tarea: Tarea, demora: float) -> None:
+        """Espera el backoff y vuelve a encolar la tarea."""
+        await asyncio.sleep(demora)
+        self.temporizadores.pop(tarea.id, None)
+        tarea.proximo_intento = None
+        try:
+            self.cola.put_nowait(tarea)
+        except asyncio.QueueFull:
+            tarea.estado = "fallida"
+            tarea.error = f"{tarea.errores[-1]} (cola llena al reintentar)"
             tarea.finalizada = time.time()
             publicar(tarea)
 
     async def cancelar(self, tarea: Tarea) -> None:
         """Cancela una tarea pendiente o en ejecución (estado no final)."""
         if tarea.estado == "pendiente":
-            # El worker la descarta al sacarla de la cola.
+            # El worker la descarta al sacarla de la cola; si espera un
+            # reintento, se cancela su temporizador.
+            temporizador = self.temporizadores.pop(tarea.id, None)
+            if temporizador is not None:
+                temporizador.cancel()
+            tarea.proximo_intento = None
             tarea.estado = "cancelada"
             tarea.finalizada = time.time()
             publicar(tarea)
