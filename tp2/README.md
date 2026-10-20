@@ -235,8 +235,12 @@ worker, que sigue consumiendo la cola.
 Recursos a medio usar, según el tipo:
 
 - **`descargar`**: el `httpx.AsyncClient` se usa dentro de `async with`. Al
-  cancelar, `asyncio.gather` cancela todas las descargas hijas y el `async with`
-  cierra las conexiones abiertas. No quedan sockets ni corrutinas huérfanas.
+  cancelar la tarea desde afuera, `asyncio.gather` cancela todas las descargas
+  hijas y el `async with` cierra las conexiones abiertas. No quedan sockets ni
+  corrutinas huérfanas. El otro caso problemático de `gather` (si una hija
+  lanza una excepción, las hermanas siguen corriendo, el motivo por el que
+  existe `TaskGroup`) acá no se da: cada descarga atrapa sus propios errores y
+  devuelve una entrada de error, así que ninguna hija falla.
 - **`esperar`**: `asyncio.sleep` se cancela al instante.
 - **`hashear`**: un cálculo que ya está corriendo en otro proceso **no se puede
   interrumpir** (`future.cancel()` solo sirve si aún no empezó). Por eso el hash
@@ -387,14 +391,15 @@ cual):
 
 | Parte del código | Concepto | Clase |
 |------------------|----------|-------|
-| `Plataforma._worker` consume de una `asyncio.Queue` compartida | Productor-consumidor, igual que con threads pero con corrutinas: no hace falta lock porque el event loop no interrumpe entre `await`s | 11 (sincronización), 21 |
+| `Plataforma._worker` consume de una `asyncio.Queue` compartida | Productor-consumidor, igual que con threads pero con corrutinas: no hace falta lock porque el event loop no interrumpe entre `await`s | 11 (sincronización), 20, 21 |
 | Todo el servidor en un hilo con un event loop | El event loop es un `select`/`epoll` sobre los sockets: atiende al que está listo | 17 (I/O multiplexing), 18 |
 | `async def` / `await` en workers y tareas | Corrutinas como evolución de los generadores (`yield` → `send()` → `await`); `await` es el punto donde se cede el control | 18 |
 | `descargar` con `asyncio.gather` | Concurrencia de I/O sobre sockets TCP sin threads | 13-14 (sockets), 20 |
-| `hashear` en `ProcessPoolExecutor` con `run_in_executor` | `concurrent.futures`, futures y procesos para CPU-bound | 8-9 (multiprocessing), 22 |
+| `hashear` en `ProcessPoolExecutor` con `run_in_executor` | `concurrent.futures`, futures y procesos para CPU-bound | 8-9 (multiprocessing), 21, 22 |
 | Elegir procesos y no threads para el hash | El GIL impide paralelismo de CPU entre threads | 10 (threading) |
-| `asyncio.timeout`, `task.cancel()`, `CancelledError` | Cancelación cooperativa y timeouts | 21 |
-| Apagado con SIGTERM/SIGINT vía `lifespan` | Señales y terminación ordenada de procesos | 6 (señales) |
+| `asyncio.timeout`, `task.cancel()`, `CancelledError` | Cancelación cooperativa y timeouts | 20 |
+| `asyncio.Queue(maxsize=...)` + `put_nowait` → `429` | Cola acotada y *backpressure*: rechazar en vez de acumular | 21 |
+| Apagado con SIGTERM/SIGINT vía `lifespan` | Señales y terminación ordenada de procesos | 6 (señales), 20, 21 |
 | API REST, códigos 202/404/409/422/429/503, WebSocket | HTTP y FastAPI | 19 |
 | `Dockerfile` en forma exec (python es PID 1) | Contenedores; PID 1 recibe el SIGTERM de `docker stop` | 1-2 (Docker) |
 
@@ -430,12 +435,43 @@ cual):
 
 ## 7. Lo que aprendí
 
-<!--
-Escribir 2-3 párrafos personales. Preguntas guía:
-- ¿Qué entendiste del event loop que antes no tenías claro?
-- ¿Qué te sorprendió de las mediciones (el GET de 7,8 s, el speedup de 18×)?
-- ¿Qué fue lo más difícil: la cancelación, el apagado, distinguir I/O de CPU?
-- ¿Qué harías distinto si lo empezaras de nuevo?
--->
+Lo más valioso de este trabajo fue entender que "asíncrono" no significa
+"paralelo". Antes pensaba que poner `async` delante de una función ya la hacía
+correr en segundo plano. Construyendo la plataforma entendí que hay **un solo
+hilo** y que todo depende de que cada corrutina devuelva el control en sus
+`await`. La medición del event loop bloqueado fue la que me lo dejó claro: ver
+un `GET` simple tardar casi 8 segundos solo porque había un hash corriendo en el
+mismo hilo vale más que cualquier explicación teórica.
 
-*(pendiente)*
+Usé inteligencia artificial como apoyo durante todo el desarrollo, y me ayudó
+mucho a comprender conceptos y a destrabarme en problemas en los que me quedaba
+estancado: por qué cancelar una tarea mataba al worker, por qué un cálculo que
+ya está en otro proceso no se puede interrumpir, o en qué orden apaga uvicorn
+las cosas al recibir una señal. Me sirvió como un tutor al que preguntarle
+"¿por qué pasa esto?" hasta entenderlo, y después verificarlo con pruebas y
+mediciones propias. Lo que me llevo es saber qué preguntar y poder explicar
+cada decisión del código.
+
+En lo técnico, me quedo con estas cosas:
+
+- **Cooperación del event loop**: `time.sleep()` o un cálculo puro congelan todo
+  el servidor; `asyncio.sleep()` y la I/O de red ceden el control.
+- **I/O-bound vs CPU-bound**: la I/O se resuelve con concurrencia
+  (`asyncio.gather` dio un speedup de 18×); la CPU necesita procesos
+  (`ProcessPoolExecutor` + `run_in_executor`) por el GIL.
+- **Cancelación limpia**: `task.cancel()` actúa en el próximo `await`;
+  `CancelledError` se atrapa para registrar el estado y se vuelve a lanzar,
+  nunca se traga. Para cancelar un cálculo CPU hubo que partirlo en bloques.
+- **`asyncio.wait` vs `await task`**: esperar la tarea interna con
+  `asyncio.wait` evita que su cancelación mate al worker.
+- **Productor-consumidor sin locks**: una `asyncio.Queue` acotada, con
+  `put_nowait` y `429` como *backpressure*; no hace falta `Lock` porque nada
+  interrumpe entre dos `await`.
+- **Timeouts** con `asyncio.timeout()`, y por qué no funcionan sobre código que
+  nunca hace `await`.
+- **Apagado ordenado**: señales, el `lifespan` de FastAPI, el PID 1 en Docker
+  con `CMD` en forma exec, y `stop_grace_period` para que Docker no mate el
+  proceso antes de volcar el estado.
+- **Medir en vez de suponer**: el techo del pool resultó ser ⌈N / WORKERS⌉ para
+  tareas de I/O y la cantidad de núcleos para las de CPU, dos límites distintos
+  que no habría distinguido sin medirlos.
