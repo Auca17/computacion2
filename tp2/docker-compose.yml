@@ -23,3 +23,23 @@ services:
     command: ["python", "-m", "servidor_lento.main"]
     ports:
       - "8001:8001"
+
+  # Bonus Celery: solo se levanta con `--profile celery`
+  redis:
+    image: redis:7-alpine
+    profiles: ["celery"]
+    ports:
+      - "6379:6379"
+
+  celery_worker:
+    build: .
+    profiles: ["celery"]
+    command: >
+      celery -A celery_app.tareas worker --loglevel=info
+      --concurrency=${CELERY_CONCURRENCIA:-4}
+    environment:
+      CELERY_BROKER: redis://redis:6379/0
+      CELERY_CONCURRENCIA: ${CELERY_CONCURRENCIA:-4}
+    depends_on:
+      - redis
+      - lento
