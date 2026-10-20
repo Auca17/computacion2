@@ -1,0 +1,25 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      WORKERS: ${WORKERS:-4}
+      TIMEOUT_DEFECTO: ${TIMEOUT_DEFECTO:-30}
+      GRACIA_APAGADO: ${GRACIA_APAGADO:-10}
+      MODO_CPU: ${MODO_CPU:-executor}
+      MAX_COLA: ${MAX_COLA:-1000}
+      DIR_VOLCADOS: /datos
+    volumes:
+      - ./datos:/datos
+    # Mayor que GRACIA_APAGADO (10 s) + margen de uvicorn, para que
+    # Docker no mate el proceso antes del volcado de estado
+    stop_grace_period: 30s
+    depends_on:
+      - lento
+
+  lento:
+    build: .
+    command: ["python", "-m", "servidor_lento.main"]
+    ports:
+      - "8001:8001"
