@@ -7,6 +7,8 @@ import uvicorn
 from fastapi import FastAPI
 
 from .api import router
+from .eventos import cerrar_todos, router as router_eventos
+from .metricas import router as router_metricas
 from . import config
 from .cola import plataforma
 from .estado import reportar_volcado_previo, volcar_registro
@@ -24,12 +26,15 @@ async def lifespan(app: FastAPI):
     yield
     log.info("Apagado: no se aceptan tareas nuevas")
     await plataforma.apagar(config.GRACIA_APAGADO)
+    cerrar_todos()  # los WebSocket abiertos no deben frenar el apagado
     ruta = volcar_registro()
     log.info("Estado volcado en %s", ruta)
 
 
 app = FastAPI(title="Plataforma de tareas", lifespan=lifespan)
 app.include_router(router)
+app.include_router(router_eventos)
+app.include_router(router_metricas)
 
 if __name__ == "__main__":
     # Un solo proceso: el estado vive en memoria. El timeout evita que

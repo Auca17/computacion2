@@ -7,6 +7,7 @@ from concurrent.futures import ProcessPoolExecutor
 from typing import Optional
 
 from . import config
+from .eventos import publicar
 from .estado import Tarea, registro
 from .tareas import EJECUTORES
 
@@ -72,6 +73,7 @@ class Plataforma:
         """
         tarea.estado = "ejecutando"
         tarea.iniciada = time.time()
+        publicar(tarea)
         interna = asyncio.create_task(self._ejecutar(tarea))
         self.en_ejecucion[tarea.id] = interna
         try:
@@ -103,6 +105,7 @@ class Plataforma:
             tarea.error = f"{type(exc).__name__}: {exc}"
         finally:
             tarea.finalizada = time.time()
+            publicar(tarea)
 
     async def cancelar(self, tarea: Tarea) -> None:
         """Cancela una tarea pendiente o en ejecución (estado no final)."""
@@ -110,6 +113,7 @@ class Plataforma:
             # El worker la descarta al sacarla de la cola.
             tarea.estado = "cancelada"
             tarea.finalizada = time.time()
+            publicar(tarea)
         elif tarea.estado == "ejecutando":
             interna = self.en_ejecucion.get(tarea.id)
             if interna is not None:
@@ -119,6 +123,7 @@ class Plataforma:
                 # Cancelada antes de arrancar: su manejador no llegó a correr.
                 tarea.estado = "cancelada"
                 tarea.finalizada = time.time()
+                publicar(tarea)
 
     async def apagar(self, gracia: float) -> None:
         """Deja de aceptar, espera hasta `gracia` s, cancela el resto y cierra."""

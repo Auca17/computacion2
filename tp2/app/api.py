@@ -8,7 +8,9 @@ from pydantic import BaseModel, Field, HttpUrl, ValidationError
 
 from . import config
 from .cola import plataforma
+from .eventos import publicar
 from .estado import ESTADOS, Tarea, registro
+from .metricas import calcular_estadisticas
 
 router = APIRouter()
 
@@ -57,6 +59,7 @@ async def crear_tarea(datos: NuevaTarea):
         plataforma.encolar(tarea)
     except asyncio.QueueFull:
         raise HTTPException(429, "La cola de tareas está llena")
+    publicar(tarea)
     return {"id": tarea.id, "estado": tarea.estado}
 
 
@@ -93,21 +96,4 @@ async def cancelar_tarea(id_tarea: str):
 @router.get("/estadisticas")
 async def estadisticas():
     """Totales por estado, duraciones promedio y ocupación de workers."""
-    por_estado = {e: 0 for e in ESTADOS}
-    duraciones: dict[str, list[float]] = {}
-    for t in registro.values():
-        por_estado[t.estado] += 1
-        if t.duracion() is not None:
-            duraciones.setdefault(t.tipo, []).append(t.duracion())
-    todas = [d for lista in duraciones.values() for d in lista]
-    return {
-        "total": len(registro),
-        "por_estado": por_estado,
-        "duracion_promedio": sum(todas) / len(todas) if todas else None,
-        "duracion_promedio_por_tipo": {
-            tipo: sum(lista) / len(lista) for tipo, lista in duraciones.items()
-        },
-        "workers_ocupados": plataforma.ocupados,
-        "workers_total": config.WORKERS,
-        "tamanio_cola": plataforma.cola.qsize() if plataforma.cola else 0,
-    }
+    return calcular_estadisticas()
