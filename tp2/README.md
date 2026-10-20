@@ -36,6 +36,11 @@ Documentación interactiva: <http://localhost:8000/docs>.
 | `MODO_CPU` | `executor` | `executor` o `bloqueante` (este último solo para la medición 2) |
 | `MAX_COLA` | `1000` | Tamaño máximo de la cola; si se llena, `POST` responde `429` |
 | `DIR_VOLCADOS` | `/datos` | Carpeta de los volcados `estado_<timestamp>.json` (montada en `./datos`) |
+| `PROCESOS_CPU` | `os.cpu_count()` | Procesos del `ProcessPoolExecutor` |
+| `MAX_CONEXIONES` | `20` | Conexiones simultáneas por tarea en `descargar`/`sondear` (`Semaphore`) |
+| `ENVEJECIMIENTO_S` | `5` | Cada cuántos segundos de espera una tarea "sube" un nivel de prioridad (bonus) |
+| `BACKOFF_BASE` | `1` | Base (s) del backoff exponencial de reintentos (bonus) |
+| `RATE_LIMIT_POR_SEG` / `RATE_LIMIT_RAFAGA` | `20` / `40` | Tasa y ráfaga de `POST` por cliente (bonus) |
 
 Ejemplo: `WORKERS=16 docker compose up --build`.
 
@@ -53,8 +58,13 @@ Ejemplo: `WORKERS=16 docker compose up --build`.
 
 Estados: `pendiente` → `ejecutando` → `completada` | `fallida` | `cancelada`.
 
+Cuerpo del `POST`: `tipo` (`descargar`, `hashear`, `esperar` o `sondear`),
+`parametros`, y opcionales `timeout` (s), `prioridad` (1 = más alta … 10,
+defecto 5) y `reintentos` (0–5, defecto 0).
+
 Códigos de error: `404` id inexistente, `409` cancelar una tarea ya terminada,
-`422` cuerpo inválido, `429` cola llena, `503` la plataforma se está apagando.
+`422` cuerpo inválido, `429` cola llena o límite de tasa del cliente (con
+`Retry-After`), `503` la plataforma se está apagando.
 
 ### Ejemplos con `curl`
 
@@ -71,6 +81,14 @@ curl -X POST localhost:8000/tareas -H 'Content-Type: application/json' \
 # Esperar 30 s con timeout de 5 s (termina fallida por timeout)
 curl -X POST localhost:8000/tareas -H 'Content-Type: application/json' \
   -d '{"tipo":"esperar","parametros":{"segundos":30},"timeout":5}'
+
+# Tarea propia: sondear puertos TCP (bonus)
+curl -X POST localhost:8000/tareas -H 'Content-Type: application/json' \
+  -d '{"tipo":"sondear","parametros":{"host":"lento","puertos":[8001,22,80]}}'
+
+# Prioridad alta y hasta 3 reintentos con backoff (bonus)
+curl -X POST localhost:8000/tareas -H 'Content-Type: application/json' \
+  -d '{"tipo":"descargar","parametros":{"urls":["http://noexiste.invalid"]},"prioridad":1,"reintentos":3}'
 
 # Consultar
 curl localhost:8000/tareas
@@ -93,7 +111,7 @@ cliente WebSocket).
 ```bash
 cd tp2
 pip install -r requirements.txt
-python -m pytest -q        # 21 tests, ~2 s
+python -m pytest -q        # 37 tests, ~6 s
 ```
 
 ### Apagado ordenado
@@ -130,7 +148,8 @@ arrancar, el log informa el volcado previo.
   │  cada tarea corre en su propio asyncio.Task   │
   │  con asyncio.timeout(...)                     │
   │                                               │
-  │  descargar ─► httpx.AsyncClient + gather      │
+  │  descargar ─► httpx + TaskGroup + Semaphore   │
+  │  sondear   ─► open_connection + TaskGroup     │
   │  esperar   ─► asyncio.sleep                   │
   │  hashear   ─► run_in_executor ──┐             │
   └─────────────────────────────────┼─────────────┘
@@ -150,10 +169,13 @@ arrancar, el log informa el volcado previo.
    esperar**. Si la cola está llena, `429`.
 2. Un worker libre hace `await cola.get()`, marca la tarea `ejecutando` y la
    lanza en un `asyncio.Task` propio, envuelto en `asyncio.timeout(timeout)`.
-3. Según el tipo: las descargas se hacen todas a la vez con `asyncio.gather`;
-   el hash se calcula en otro proceso; la espera es un `asyncio.sleep`.
+3. Según el tipo: las descargas se hacen a la vez en un `asyncio.TaskGroup`
+   (hasta `MAX_CONEXIONES` simultáneas); el hash se calcula en otro proceso;
+   la espera es un `asyncio.sleep`.
 4. Al terminar queda `completada` (con resultado), `fallida` (con motivo) o
-   `cancelada`. Cada cambio de estado se publica en `/eventos`.
+   `cancelada`. Si falló y le quedan reintentos, vuelve a `pendiente` y se
+   reencola tras un backoff exponencial. Cada cambio de estado se publica en
+   `/eventos`.
 5. `GET /tareas/{id}` lee el registro en memoria.
 
 ### Estructura
@@ -163,14 +185,18 @@ tp2/
   app/
     main.py        lifespan (arranque/apagado) y uvicorn
     api.py         endpoints HTTP y validación
-    cola.py        Plataforma: cola, workers, cancelación, apagado
-    tareas.py      descargar / hashear / esperar
+    cola.py        ColaConPrioridad y Plataforma: workers, cancelación,
+                   reintentos, apagado
+    tareas.py      descargar / hashear / esperar / sondear
+    limite.py      rate limiting por cliente (cubeta de tokens)
     estado.py      Tarea, registro en memoria, volcado JSON
     config.py      variables de entorno
     eventos.py     WebSocket /eventos
     metricas.py    /estadisticas y /metricas (Prometheus)
   servidor_lento/  servidor de demora para las mediciones
-  scripts/         medir_io.py, medir_bloqueo.py, medir_techo.py, resultados.md
+  celery_app/      el pool reimplementado con Celery (bonus, profile "celery")
+  scripts/         medir_io.py, medir_bloqueo.py, medir_techo.py, resultados.md,
+                   comparar_celery.py, resultados_celery.md
   tests/           pytest-asyncio
 ```
 
@@ -235,12 +261,15 @@ worker, que sigue consumiendo la cola.
 Recursos a medio usar, según el tipo:
 
 - **`descargar`**: el `httpx.AsyncClient` se usa dentro de `async with`. Al
-  cancelar la tarea desde afuera, `asyncio.gather` cancela todas las descargas
-  hijas y el `async with` cierra las conexiones abiertas. No quedan sockets ni
-  corrutinas huérfanas. El otro caso problemático de `gather` (si una hija
-  lanza una excepción, las hermanas siguen corriendo, el motivo por el que
-  existe `TaskGroup`) acá no se da: cada descarga atrapa sus propios errores y
-  devuelve una entrada de error, así que ninguna hija falla.
+  cancelar la tarea, el `asyncio.TaskGroup` cancela todas las descargas hijas
+  y **espera a que terminen** antes de salir del bloque (concurrencia
+  estructurada, clase 21), y el `async with` del cliente cierra las conexiones
+  abiertas. No quedan sockets ni corrutinas huérfanas. Se eligió `TaskGroup` y
+  no `gather` justamente por eso: con `gather`, si una hija lanza una excepción
+  las hermanas siguen corriendo sueltas. Además cada descarga atrapa sus
+  propios errores (una URL caída es una entrada de error, no un fallo de la
+  tarea), y un `Semaphore(MAX_CONEXIONES)` limita las conexiones simultáneas
+  (clase 20).
 - **`esperar`**: `asyncio.sleep` se cancela al instante.
 - **`hashear`**: un cálculo que ya está corriendo en otro proceso **no se puede
   interrumpir** (`future.cancel()` solo sirve si aún no empezó). Por eso el hash
@@ -303,6 +332,11 @@ una vez.
 
 Referencia directa desde el script: `for` con `await` 10,07 s contra
 `asyncio.gather` 0,55 s (18,2×).
+
+> Esta medición se tomó cuando `descargar` usaba `asyncio.gather`; hoy usa
+> `TaskGroup` con `Semaphore(20)`. Con 20 URLs y un límite de 20 conexiones el
+> comportamiento es el mismo (todas a la vez). La comparación con Celery
+> (sección 8), tomada después del cambio, dio 0,65 s para el mismo caso.
 
 **Interpretación**: lo concurrente tarda lo que la descarga más lenta (~0,5 s)
 más un poco de overhead, no la suma (20 × 0,5 = 10 s). Mientras una descarga
@@ -394,7 +428,11 @@ cual):
 | `Plataforma._worker` consume de una `asyncio.Queue` compartida | Productor-consumidor, igual que con threads pero con corrutinas: no hace falta lock porque el event loop no interrumpe entre `await`s | 11 (sincronización), 20, 21 |
 | Todo el servidor en un hilo con un event loop | El event loop es un `select`/`epoll` sobre los sockets: atiende al que está listo | 17 (I/O multiplexing), 18 |
 | `async def` / `await` en workers y tareas | Corrutinas como evolución de los generadores (`yield` → `send()` → `await`); `await` es el punto donde se cede el control | 18 |
-| `descargar` con `asyncio.gather` | Concurrencia de I/O sobre sockets TCP sin threads | 13-14 (sockets), 20 |
+| `descargar` con `asyncio.TaskGroup` | Concurrencia de I/O sobre sockets TCP sin threads; concurrencia estructurada | 13-14 (sockets), 20, 21 |
+| `Semaphore(MAX_CONEXIONES)` en `descargar`/`sondear` | Limitar cuántas corrutinas usan un recurso a la vez | 20 |
+| Tarea `sondear` con `asyncio.open_connection` | Conexión TCP (el `connect()` de sockets) hecha asíncrona; cerrar con `close()` + `wait_closed()` | 13-14, 20 |
+| `ColaConPrioridad` hereda de `asyncio.Queue` | Productor-consumidor con prioridad y envejecimiento contra inanición | 11, 21 |
+| `LimitadorTasa` sin lock | Estado compartido sin lock: `consumir` no tiene `await`, nada se intercala | 11, 20 |
 | `hashear` en `ProcessPoolExecutor` con `run_in_executor` | `concurrent.futures`, futures y procesos para CPU-bound | 8-9 (multiprocessing), 21, 22 |
 | Elegir procesos y no threads para el hash | El GIL impide paralelismo de CPU entre threads | 10 (threading) |
 | `asyncio.timeout`, `task.cancel()`, `CancelledError` | Cancelación cooperativa y timeouts | 20 |
@@ -427,7 +465,16 @@ cual):
 - **`stop_grace_period` es fijo (30 s)** en `docker-compose.yml`: si se sube
   `GRACIA_APAGADO` por encima de ~10 s hay que subirlo también, o Docker mata el
   proceso con SIGKILL antes del volcado.
-- **Sin autenticación ni rate limiting por cliente.**
+- **Sin autenticación.** El rate limiting identifica al cliente por IP: detrás
+  de un proxy o NAT, muchos clientes comparten la misma cubeta, y las cubetas
+  de IPs viejas nunca se borran.
+- **Los reintentos no distinguen errores transitorios de permanentes**: un
+  tarea que siempre va a fallar (por ejemplo, un `hashear` que excede su
+  timeout) se reintenta igual hasta agotar los intentos.
+- **Una tarea en backoff no recibe la gracia del apagado**: no está en la cola,
+  así que `cola.join()` no la espera y se cancela de inmediato al apagar.
+- **El rate limit se aplica antes de validar el cuerpo**: un `POST` inválido
+  (`422`) también gasta un token del cliente.
 - **Un solo proceso de API**: no escala horizontalmente porque el estado está en
   memoria.
 
@@ -475,3 +522,159 @@ En lo técnico, me quedo con estas cosas:
 - **Medir en vez de suponer**: el techo del pool resultó ser ⌈N / WORKERS⌉ para
   tareas de I/O y la cantidad de núcleos para las de CPU, dos límites distintos
   que no habría distinguido sin medirlos.
+
+---
+
+## 8. Extensiones opcionales (bonus)
+
+Las ocho extensiones de la consigna están implementadas.
+
+| # | Extensión | Dónde | Cómo se prueba |
+|---|-----------|-------|----------------|
+| 1 | WebSocket `/eventos` | `app/eventos.py` | `tests/test_eventos_metricas.py` |
+| 2 | Prioridades | `app/cola.py` (`ColaConPrioridad`) | `tests/test_bonus.py` |
+| 3 | Reintentos con backoff exponencial | `app/cola.py` (`_fallar`, `_reencolar_tras`) | `tests/test_bonus.py` |
+| 4 | Rate limiting por cliente | `app/limite.py` | `tests/test_bonus.py` |
+| 5 | Métricas Prometheus `/metricas` | `app/metricas.py` | `tests/test_eventos_metricas.py` |
+| 6 | Tests con `pytest-asyncio` | `tests/` (37 tests) | `python -m pytest -q` |
+| 7 | Celery | `celery_app/`, `scripts/comparar_celery.py` | `scripts/resultados_celery.md` |
+| 8 | Tarea propia `sondear` | `app/tareas.py` | `tests/test_bonus.py` |
+
+### 8.1 WebSocket `/eventos`
+
+Cada cliente conectado tiene su propia `asyncio.Queue(maxsize=100)`. Cada
+cambio de estado llama a `publicar()`, que hace `put_nowait` en todas: si un
+cliente lento tiene el buffer lleno, se le descarta el mensaje. Así un cliente
+lento **nunca frena a los workers**. Al apagar, se manda un centinela `None` a
+cada cola para cerrar las conexiones.
+
+### 8.2 Prioridades y cómo se evita la inanición
+
+`ColaConPrioridad` hereda de `asyncio.Queue` y redefine solo los métodos
+internos `_init`, `_put` y `_get`, igual que lo hace la propia
+`asyncio.PriorityQueue` de la biblioteca estándar. Así siguen funcionando sin
+cambios `maxsize`, `put_nowait` (y el `429`), `task_done` y `join` (que usa el
+apagado).
+
+Con prioridad pura, una tarea de prioridad 10 podría no ejecutarse nunca si
+siempre llegan tareas de prioridad 1: eso es **inanición**. Para evitarlo se
+usa **envejecimiento**: al sacar de la cola se calcula
+
+```
+prioridad_efectiva = prioridad - espera_en_cola / ENVEJECIMIENTO_S
+```
+
+Cada `ENVEJECIMIENTO_S` segundos (5 por defecto) de espera, la tarea "sube" un
+nivel. Una tarea de prioridad 10 que espera 45 s ya vale como una de prioridad
+1 recién llegada, así que su espera máxima está acotada. A igual valor gana la
+que llegó antes (FIFO). La búsqueda es lineal (O(n) con n ≤ `MAX_COLA`) porque
+la prioridad efectiva cambia con el tiempo y un heap quedaría desordenado.
+
+### 8.3 Reintentos con backoff exponencial
+
+El `POST` acepta `reintentos` (0 a 5). Si una tarea falla (excepción o
+timeout, **nunca** una cancelación) y le quedan intentos:
+
+1. vuelve a `pendiente`, guarda el error en `errores` y suma `intentos`;
+2. se programa un **temporizador** (`asyncio.create_task`) que duerme
+   `BACKOFF_BASE × 2^(intento-1)` segundos (1 s, 2 s, 4 s…) con un ±20 % de
+   *jitter* para que muchas tareas que fallaron juntas no reintenten todas en
+   el mismo instante;
+3. al vencer, la tarea se vuelve a encolar.
+
+El worker **no espera el backoff**: queda libre al instante para otra tarea.
+Un `DELETE` durante el backoff cancela el temporizador, y el apagado cancela
+todos los temporizadores pendientes. El campo `proximo_intento` dice cuándo se
+reintenta, y `/metricas` cuenta `reintentos_programados_total`.
+
+### 8.4 Rate limiting por cliente
+
+Es una **cubeta de tokens** por IP (`app/limite.py`). Cada cliente arranca con
+`RATE_LIMIT_RAFAGA` tokens (40), que se recargan a `RATE_LIMIT_POR_SEG` (20)
+por segundo, y cada `POST /tareas` gasta uno. Sin tokens, la respuesta es `429`
+con la cabecera `Retry-After` (segundos hasta tener un token). Permite ráfagas
+cortas pero limita la tasa sostenida. No usa lock: `consumir()` no tiene
+`await`, así que nada se intercala a mitad de la cuenta.
+
+### 8.5 Métricas Prometheus
+
+`GET /metricas` devuelve el formato de texto de Prometheus, armado a mano y
+sin dependencias. Expone tareas por estado, workers ocupados y totales, tamaño
+de la cola, duración promedio por tipo, reintentos programados y rechazos por
+límite. Los números salen de la misma función que `/estadisticas`.
+
+### 8.6 Tests
+
+Son 37 tests con `pytest-asyncio`. Hablan con la app por HTTP sin red
+(`httpx.ASGITransport`). Cubren:
+
+- API y códigos de error;
+- cancelación de tareas pendientes y en ejecución (`esperar`, `hashear`), y que
+  el worker sobreviva;
+- timeouts y excepciones;
+- cola llena (`429`) y apagado (`503` y volcado);
+- WebSocket y métricas;
+- todos los bonus: orden por prioridad, envejecimiento, reintentos exitosos,
+  agotados y cancelados durante el backoff, rate limit, `sondear` y el límite
+  de concurrencia del `Semaphore`.
+
+### 8.7 Celery: el pool reimplementado y comparado
+
+`celery_app/tareas.py` implementa las mismas tres tareas como tareas de Celery,
+con Redis como broker y como backend de resultados. `hashear` reusa
+`hashear_bloque`, así que el resultado es idéntico. Los servicios `redis` y
+`celery_worker` están detrás del *profile* `celery`, así que el
+`docker compose up --build` obligatorio no cambia:
+
+```bash
+docker compose --profile celery up --build -d
+MSYS_NO_PATHCONV=1 docker compose --profile celery run --rm --no-deps \
+  -e PYTHONPATH=/srv -v ./scripts:/srv/scripts celery_worker \
+  python scripts/comparar_celery.py --salida /srv/scripts/resultados_celery.md
+```
+
+Las dos versiones se midieron con el mismo paralelismo: 4 workers asyncio
+contra 4 procesos de Celery.
+
+| Prueba | API asyncio | Celery |
+|--------|------------:|-------:|
+| 20 × `esperar(1 s)` | 5,31 s | 5,31 s |
+| 8 × `hashear` (~1 s c/u) | 2,60 s | 2,19 s |
+| 20 descargas de 0,5 s, en 1 tarea | 0,65 s | 0,63 s |
+| 20 descargas de 0,5 s, en 20 tareas | — | 2,90 s |
+| Cancelar un `esperar(30)` | 0,02 s (`DELETE`) | 0,01 s (`revoke(terminate=True)`) |
+| Latencia de encolar (media) | 10,6 ms (`POST`) | 1,4 ms (`.delay()`) |
+
+**Interpretación**:
+
+- **Cuando el límite es el paralelismo, el framework no importa.** Con 4
+  workers contra 4 procesos, las esperas empatan.
+- **Para I/O gana la concurrencia dentro de un proceso.** Una tarea con 20
+  descargas concurrentes (asyncio) tarda 0,65 s. Las mismas 20 descargas como
+  tareas sueltas en Celery tardan 2,90 s, porque cada proceso hace una a la
+  vez. Un worker de Celery es un proceso que bloquea mientras espera la red, y
+  por eso adentro de una tarea de Celery `time.sleep` es correcto.
+- **La cancelación es distinta en el fondo.** Nosotros cancelamos una
+  corrutina en su próximo `await` y el worker sigue vivo. Celery con
+  `terminate=True` **mata el proceso hijo** con SIGTERM y el pool levanta otro
+  (los PID pasaron de [8, 9, 10, 11] a [8, 9, 10, 64]). Es más brusco: lo que
+  ese proceso tenía a medio hacer se pierde sin limpieza.
+- **Celery encola más barato** (publicar en Redis contra un viaje HTTP con
+  validación). A cambio suma dos servicios (Redis y los workers); la ventaja es
+  que las tareas quedan en el broker, fuera del proceso que las encoló.
+- **Conclusión**: para este TP, asyncio alcanza y es más simple. Celery
+  conviene cuando el trabajo tiene que repartirse entre varias máquinas, o
+  cuando las tareas tienen que sobrevivir a la caída de la API.
+
+### 8.8 Tarea propia: `sondear`
+
+Chequea puertos TCP de un host de forma concurrente. Para cada puerto intenta
+`asyncio.open_connection(host, puerto)` con un timeout: si conecta, informa
+`abierto` y la latencia en ms, y cierra la conexión con `close()` +
+`wait_closed()`. Si la rechazan o no responde, informa `abierto: false` y el
+motivo. Usa el mismo `TaskGroup` + `Semaphore` que `descargar`.
+
+Se eligió porque une las dos mitades del cuatrimestre: es el `connect()` de
+los sockets TCP de las clases 13-14, pero asíncrono como en la clase 20.
+Además es I/O puro: sondea hasta `MAX_CONEXIONES` puertos a la vez, y cada
+tanda tarda lo que el puerto más lento, no la suma.
