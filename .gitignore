@@ -61,3 +61,14 @@ __pycache__/
 
 # OS
 .DS_Store
+# === TP2: archivos locales (no se suben) ===
+tp2/Consigna.md
+tp2/EXPLICACION.md
+tp2/datos/
+estado_*.json
+.pytest_cache/
+
+# === Herramientas de IA (gentle-ai, ODD, Engram) ===
+.atl/
+odd/
+.engram/
